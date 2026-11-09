@@ -3,12 +3,13 @@
 A [Model Context Protocol](https://modelcontextprotocol.io) bridge that lets an external LLM
 application (Claude Desktop, Cursor, Cline, Continue, etc.) read your openGym profile —
 routines, workouts, body-weight log, estimated 1RMs, and muscle balance — directly from your
-self-hosted `./data` directory, and log a workout you describe to it.
+self-hosted `./data` directory, log a workout you describe to it, and save a routine you
+describe to it.
 
 It runs locally as a stdio process spawned by the LLM client and adds no new container. The
 read tools need no authentication: they read the same `state-<uid>.json` files the openGym api
 already writes, and the LLM never sees passkeys, VAPID keys, or session secrets. The one write
-tool, `log_workout`, is off until you pair it with your server (see
+tools, `log_workout` and `save_routine`, are off until you pair them with your server (see
 [Logging workouts](#logging-workouts)).
 
 The numbers it answers with are computed by the **same pure functions the React UI uses**
@@ -67,7 +68,7 @@ the server's stderr.
 
 ## Tools
 
-Nine read-only tools, and one that writes:
+Nine read-only tools, and two that write:
 
 | Tool | What it answers |
 |---|---|
@@ -81,6 +82,7 @@ Nine read-only tools, and one that writes:
 | `estimate_1rm` | All-time best 1RM for an exercise + the trend, or a PR table across all exercises. |
 | `muscle_balance` | Which muscles I've trained this week/month/all-time, ranked + which I've neglected. |
 | `log_workout` | *Writes.* "I did dumbbell curls, 12 kg, 12/12/10" → a logged session in your history, on every device. Needs pairing: [Logging workouts](#logging-workouts). |
+| `save_routine` | *Writes.* "Day A: leg press 3 × 12, lat pulldown 3 × 12, plank 3 × 30 s, then 15 min on the treadmill at 6 km/h" → a routine in your plan, optionally on Monday and Thursday. Same pairing: [Saving routines](#saving-routines). |
 
 `get_routine` and `preview_session` answer two different questions, and confusing them is the
 easiest way for a coach to give wrong advice. `get_routine` reports what the routine *stores*.
@@ -162,6 +164,29 @@ Things to know about that token:
   1RM, PRs and the muscle map, and like any freestyle session it can inform a routine that has
   no history of its own, but it does not tick off a planned day or a coach week's session.
 
+## Saving routines
+
+`save_routine` turns a routine you describe into one the Plan screen shows, on every device:
+
+> "Save my Day A: leg press 3 × 12, lat pulldown 3 × 12, chest press 3 × 12, plank 3 × 30 s,
+> and 15 minutes walking at 6 km/h with 4% incline. Put it on Mondays and Thursdays."
+
+One call saves one routine, so a two-day plan is two calls. Each exercise takes reps (with an
+optional bottom for a range, 8 to 12), seconds for a hold, or minutes, speed and incline for
+cardio, plus sets, a planned weight, its own rest, a note, "per side" and a superset label.
+Anything left out is what picking the exercise in the editor gives, and a weight left out is
+asked for the first time you train it. Names are matched the way `log_workout` matches them,
+with the same questions back when a name is ambiguous, and the reply reads each exercise back
+in the app's words ("3 × 12", "8/side", "15 min @ 6 km/h · 4% incline").
+
+- **Weekdays:** `weekdays` puts the routine on those days beside what they already hold;
+  `weekdays_exclusive` makes it the only routine on them. Without `weekdays` the week is not touched.
+- **Replacing:** pass `routine_id` (from `list_routines`) and its exercise list becomes the one
+  given; its name, emoji and progression rule stay unless you give new ones. A new routine under
+  a name the profile already has is refused, so asking twice does not make two.
+- It uses the same token and limit as `log_workout` (20 saves an hour, counted separately) and
+  leaves one line on stderr per save.
+
 ## How it reuses the training logic
 
 The MCP server imports the training helpers under `frontend/src/lib/` directly as Node ESM
@@ -199,11 +224,11 @@ missing routine, zero-workout history, no synced state, superset links, three 1R
 tools see consistent values regardless of when the suite runs. The pure lib functions have
 their own 92 tests in `frontend/src/lib/*.test.js`.
 
-`log_workout` has two more files: `write-tools.test.js` against a stand-in api (conflicts,
-retries, a rejected token, dry runs, duplicates), and `log-workout.e2e.test.js` against the real
-`api/server.js` on a temp data directory, which needs `npm ci` in `api/` (it skips without it on
-a laptop and fails under `CI`). The workout it builds is tested in
-`frontend/src/lib/log-workout.test.js`.
+`log_workout` and `save_routine` have two more files: `write-tools.test.js` against a stand-in
+api (conflicts, retries, a rejected token, dry runs, duplicates), and `log-workout.e2e.test.js`
+against the real `api/server.js` on a temp data directory, which needs `npm ci` in `api/` (it
+skips without it on a laptop and fails under `CI`). What they build is tested in
+`frontend/src/lib/log-workout.test.js` and `frontend/src/lib/save-routine.test.js`.
 
 ## Roadmap
 
@@ -215,7 +240,8 @@ a laptop and fails under `CI`). The workout it builds is tested in
   `state-<uid>.json` directly: the api is the one writer of that file, and its sync stamps are
   what keep a write from being undone by the next phone that merges.
   - **Done:** `log_workout`, on the paired-session token (`scripts/pair.mjs`).
-  - Next: `add_bodyweight`, `edit_routine`, `assign_weekday`, `override_day`, log corrections.
+  - **Done:** `save_routine` (create or replace a routine, optionally on weekdays).
+  - Next: `add_bodyweight`, `override_day`, log corrections.
 - **Phase 3:** Streamable HTTP transport, opt-in 4th container in `docker-compose.yml`. Same
   tool implementations, second transport — the MCP SDK supports both behind one tool registration.
 
