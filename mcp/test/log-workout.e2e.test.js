@@ -39,7 +39,7 @@ const get = async p => (await fetch(base + p, { headers: { authorization: 'Beare
 const stored = () => JSON.parse(fs.readFileSync(path.join(dataDir, `state-${UID}.json`), 'utf8'))
 
 describe.skipIf(!HAVE_API)('log_workout against the real api', () => {
-  let logWorkout, getState, TOOLS
+  let logWorkout, saveRoutine, getState, TOOLS
   beforeAll(async () => {
     dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gym-mcp-e2e-'))
     fs.writeFileSync(path.join(dataDir, 'secret'), SECRET, { mode: 0o600 })
@@ -65,7 +65,7 @@ describe.skipIf(!HAVE_API)('log_workout against the real api', () => {
     // The read tools read the same directory the server writes, as on a real install.
     process.env.OPENGYM_DATA = dataDir
     process.env.OPENGYM_UID = UID
-    ;({ logWorkout } = await import('../src/write-tools.js'))
+    ;({ logWorkout, saveRoutine } = await import('../src/write-tools.js'))
     ;({ getState } = await import('../src/state.js'))
     ;({ TOOLS } = await import('../src/tools.js'))
   }, 30000)
@@ -155,5 +155,46 @@ describe.skipIf(!HAVE_API)('log_workout against the real api', () => {
     expect(days).toEqual([...days].sort())
     // into the past: a backfill, so the confirmed weight stays where the device left it
     expect(after.exWeights['0025']).toEqual(DOC.exWeights['0025'])
+  })
+  // save_routine goes the same way; these run after the workouts above, on the document they left.
+  test('save_routine: a new routine on two weekdays, stored and read back by get_routine', async () => {
+    const before = stored()
+    const r = await saveRoutine.handler({
+      name: 'Day A', weekdays: ['monday', 'thursday'],
+      exercises: [{ exercise: 'leg press', sets: 3, reps: 12, rest_sec: 90 }, { exercise: 'treadmill walk', minutes: 15, speed_kmh: 6 }],
+    }, { env: env() })
+    expect(r.saved).toBe(true)
+    const after = stored()
+    expect(after._rev).toBe(before._rev + 1)
+    expect(after.routines.map(x => x.name)).toEqual(['Push', 'Day A'])
+    expect(after.routines[1]._ts).toBeGreaterThan(0)
+    expect(after.week).toEqual({ 1: ['r1', r.routine_id], 4: [r.routine_id] })
+    // the plan days it changed are on record as edited, so a phone's older week does not undo them
+    expect(after.edited['week.1']).toBeGreaterThan(0)
+    expect(after.edited['week.4']).toBeGreaterThan(0)
+    expect(after.workouts).toEqual(before.workouts)
+    const view = TOOLS.find(t => t.name === 'get_routine').handler({ routine_id: r.routine_id })
+    expect(view.exercises.map(e => e.summary)).toEqual(['3 × 12', '1 × 15 min @ 6 km/h'])
+  })
+
+  test('save_routine: replacing a routine while a phone pushes keeps both changes', async () => {
+    const phonePush = async () => {
+      const cur = await get('/api/data')
+      const res = await fetch(base + '/api/data', {
+        method: 'PUT', headers: { authorization: 'Bearer ' + TOKEN, 'content-type': 'application/json' },
+        body: JSON.stringify({ state: { ...cur.state, restSec: 60 }, baseRev: cur.rev, baseWid: cur.state._wid }),
+      })
+      expect(res.status).toBe(200)
+    }
+    let pushed = false
+    const fetchImpl = async (url, opts) => {
+      if (opts?.method === 'PUT' && !pushed) { pushed = true; await phonePush() }
+      return fetch(url, opts)
+    }
+    const r = await saveRoutine.handler({ routine_id: 'r1', exercises: [{ exercise: '0025', sets: 5, reps: 5, weight: 105 }] }, { env: env(), fetchImpl })
+    expect(r).toMatchObject({ saved: true, replaced: true })
+    const after = stored()
+    expect(after.restSec).toBe(60)
+    expect(after.routines[0]).toMatchObject({ id: 'r1', name: 'Push', ex: [{ id: '0025', sets: 5, reps: 5, weight: 105 }] })
   })
 })

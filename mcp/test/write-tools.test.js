@@ -3,7 +3,7 @@
 // with the write is log-workout.e2e.test.js; the arithmetic is frontend/src/lib/log-workout.test.js.
 import { describe, test, expect, beforeEach, afterEach, vi } from 'vitest'
 import http from 'node:http'
-import { logWorkout, WRITE_LIMIT, _resetWriteWindow } from '../src/write-tools.js'
+import { logWorkout, saveRoutine, WRITE_LIMIT, _resetWriteWindow } from '../src/write-tools.js'
 import { apiBase, apiConfig } from '../src/api-client.js'
 import { _seedStateForTests } from '../src/state.js'
 
@@ -270,7 +270,7 @@ describe('limits and the trail a write leaves', () => {
   })
 
   test('what the model reads has no em dashes', () => {
-    const texts = [logWorkout.description, ...Object.values(logWorkout.schema).map(z => z.description || '')]
+    const texts = [logWorkout, saveRoutine].flatMap(tool => [tool.description, ...Object.values(tool.schema).map(z => z.description || '')])
     for (const t of texts) expect(t).not.toContain('—')
   })
 })
@@ -305,5 +305,83 @@ describe('the token has to belong to the profile being read', () => {
     expect(err.message).not.toContain('test-uid')
     expect(api.gets).toBe(0)
     expect(api.puts).toHaveLength(0)
+  })
+})
+
+describe('save_routine writes through the server', () => {
+  // The profile this server reads is the one the token belongs to, whatever ran before.
+  beforeEach(async () => { _seedStateForTests(DOC()); api = await stubApi(DOC(), { uid: 'test-uid' }) })
+  const DAY_A = { name: 'Day A', exercises: [
+    { exercise: 'leg press', sets: 3, reps: 12, rest_sec: 90 },
+    { exercise: 'cable curl', sets: 2, reps: 12, superset: 'Arms' },
+    { exercise: 'cable pushdown', sets: 2, reps: 12, superset: 'Arms' },
+    { exercise: '0463', sets: 3, seconds: 30 },
+    { exercise: 'treadmill walk', minutes: 15, speed_kmh: 6, incline: 4 },
+  ] }
+  const save = (params, env = api.env) => saveRoutine.handler(params, { env })
+
+  test('the document the server sent, plus the routine and its weekdays', async () => {
+    const r = await save({ ...DAY_A, weekdays: ['monday', 'thursday'] })
+    expect(r).toMatchObject({ saved: true, replaced: false, name: 'Day A', weekdays: ['monday', 'thursday'], revision: 8 })
+    expect(r.exercises.map(e => e.summary)).toEqual(['3 × 12', '2 × 12', '2 × 12', '3 × 0:30', '1 × 15 min @ 6 km/h · 4% incline'])
+    expect(r.exercises[0]).toMatchObject({ id: '0739', you_said: 'leg press', rest_sec: 90 })
+    expect(api.puts).toHaveLength(1)
+    const put = api.puts[0]
+    expect(put).toMatchObject({ baseRev: 7, baseWid: 'w-abc' })
+    const { routines, week, ...rest } = put.state
+    const { routines: r0, ...rest0 } = DOC()
+    expect(rest).toEqual(rest0)
+    expect(routines.map(x => x.name)).toEqual(['Push', 'Day A'])
+    expect(routines[1].id).toBe(r.routine_id)
+    expect(week).toEqual({ 1: [r.routine_id], 4: [r.routine_id] })
+  })
+
+  test('dry_run writes nothing', async () => {
+    const r = await save({ ...DAY_A, dry_run: true })
+    expect(r).toMatchObject({ saved: false, dry_run: true })
+    expect(r.would_save.exercises).toHaveLength(5)
+    expect(api.puts).toHaveLength(0)
+  })
+
+  test('an ambiguous name saves nothing and lists candidates', async () => {
+    const r = await save({ name: 'Day A', exercises: [{ exercise: 'lever chest press', reps: 12 }] })
+    expect(r.saved).toBe(false)
+    expect(r.problems[0].candidates.length).toBeGreaterThan(1)
+    expect(api.puts).toHaveLength(0)
+  })
+
+  test('replacing by id keeps the routine where it was', async () => {
+    const r = await save({ routine_id: 'r1', exercises: [{ exercise: 'leg extension', reps: 15 }] })
+    expect(r).toMatchObject({ saved: true, replaced: true, routine_id: 'r1', name: 'Push' })
+    expect(api.puts[0].state.routines.map(x => x.id)).toEqual(['r1'])
+    expect(api.puts[0].state.routines[0].ex[0]).toMatchObject({ id: '0585', reps: 15 })
+  })
+
+  test('the same routine sent again is caught by its name', async () => {
+    expect((await save(DAY_A)).saved).toBe(true)
+    const again = await save(DAY_A)
+    expect(again.saved).toBe(false)
+    expect(again.problems[0]).toMatchObject({ field: 'name', existing: { name: 'Day A' } })
+    expect(api.puts).toHaveLength(1)
+  })
+
+  test('a conflict builds it again on the server\'s newer document, under the same id', async () => {
+    api.script.put = [(send, s) => {
+      s.doc = { ...s.doc, routines: [...s.doc.routines, { id: 'r2', name: 'Legs', ex: [] }] }
+      s.rev = 9
+      send(409, { error: 'conflict', rev: s.rev, state: s.doc })
+    }]
+    const r = await save(DAY_A)
+    expect(r.saved).toBe(true)
+    expect(api.puts).toHaveLength(2)
+    expect(api.puts[1].baseRev).toBe(9)
+    const ids = api.puts.map(p => p.state.routines.at(-1).id)
+    expect(ids[0]).toBe(ids[1])
+    expect(api.puts[1].state.routines.map(x => x.name)).toEqual(['Push', 'Legs', 'Day A'])
+  })
+
+  test('without pairing it says what to set, and reads nothing', async () => {
+    await expect(save(DAY_A, {})).rejects.toMatchObject({ code: 'ENOCONFIG' })
+    expect(api.gets).toBe(0)
   })
 })
